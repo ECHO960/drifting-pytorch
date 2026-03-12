@@ -14,7 +14,7 @@ class GaussianKernel(DriftKernel):
     Smoother than ExponentialKernel; less sensitive to outliers.
     """
 
-    def __init__(self, encoder: nn.Module | None = None, tau: float = 1.0):
+    def __init__(self, encoder: nn.Module | None = None, tau: float = 0.05):
         super().__init__()
         self.encoder = encoder
         self.tau = tau

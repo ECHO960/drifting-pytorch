@@ -17,7 +17,7 @@ encoder:
 
 kernel:
   type: exponential
-  tau: 1.0
+  tau: 0.05
 
 data:
   type: imagenet

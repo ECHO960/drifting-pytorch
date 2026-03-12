@@ -1,13 +1,15 @@
 """
 Drifting loss implementation.
 
-Core idea (arXiv 2602.04770):
-  1. Generate x = f_θ(ε)
-  2. Compute drift field V(x) = V⁺_p(x) − V⁻_q(x)
-       V⁺: attraction toward real data  y_pos ~ p_data
-       V⁻: repulsion from generated     y_neg = x (current batch)
-  3. Loss = MSE(x,  stopgrad(x + V(x)))
-  4. Anti-symmetry is guaranteed by construction: V_{p,q} = -V_{q,p}
+Matches the official Colab demo (lambertae/lambertae.github.io).
+
+Key differences vs. naive row-norm:
+  - Joint kernel matrix over [gen; pos] — one cdist call
+  - Symmetric normalization: k[i,j] / sqrt(row_sum[i] * col_sum[j])
+    (graph Laplacian style, not softmax)
+  - Self-masking: gen[i]->gen[i] distance set to inf
+  - Confidence-weighted V: V = (nk_pos * s_neg) @ pos - (nk_neg * s_pos) @ gen
+    drift magnitude scales with neighborhood density
 """
 
 from __future__ import annotations
@@ -20,48 +22,70 @@ from kernels import DriftKernel
 
 
 # ---------------------------------------------------------------------------
-# Core field computation
+# Core field computation  (matches official implementation)
 # ---------------------------------------------------------------------------
 
 def compute_drift_field(
     x_gen: Tensor,
     y_pos: Tensor,
-    y_neg: Tensor,
     kernel: DriftKernel,
 ) -> Tensor:
     """
-    Compute V_{p,q}(x) = V⁺_p(x) − V⁻_q(x).
+    Compute drift field V(x_gen) toward y_pos and away from x_gen itself.
+
+    Algorithm:
+      1. targets = [gen; pos]
+      2. dist = cdist(encode(gen), encode(targets))  [G, G+P]
+      3. Mask diagonal (gen[i] vs gen[i]) -> inf
+      4. k = exp(-dist / tau)
+      5. Symmetric norm: nk = k / sqrt(row_sum x col_sum)
+      6. s_neg = sum_j nk_neg[i,j],  s_pos = sum_j nk_pos[i,j]
+      7. V = (nk_pos * s_neg) @ pos - (nk_neg * s_pos) @ gen
 
     Args:
-        x_gen: [N, D] generated samples (query points)
-        y_pos: [P, D] real data samples  (positives from p_data)
-        y_neg: [Q, D] generated samples  (negatives from q_θ; usually = x_gen)
-        kernel: DriftKernel instance
-
-    Returns:
-        V: [N, D] drift vector for each generated sample
+        x_gen:  [N, *] generated samples
+        y_pos:  [P, *] real data samples (same class / task)
+        kernel: DriftKernel -- encoder phi accessed via kernel.encoder, tau via kernel.tau
     """
-    x_flat = x_gen.flatten(1)   # [N, D]
-    p_flat = y_pos.flatten(1)   # [P, D]
-    q_flat = y_neg.flatten(1)   # [Q, D]
+    G = x_gen.shape[0]
 
-    # Unnormalized weights
-    w_pos = kernel(x_gen, y_pos)        # [N, P]
-    w_neg = kernel(x_gen, y_neg)        # [N, Q]
+    x_flat = x_gen.flatten(1).float()   # [G, D]
+    p_flat = y_pos.flatten(1).float()   # [P, D]
 
-    # Row-normalize (softmax-style but with explicit sum)
-    w_pos = w_pos / (w_pos.sum(dim=-1, keepdim=True) + 1e-8)
-    w_neg = w_neg / (w_neg.sum(dim=-1, keepdim=True) + 1e-8)
+    # Feature encoding
+    encoder = getattr(kernel, "encoder", None)
+    tau     = getattr(kernel, "tau", 0.05)
 
-    # V⁺(x) = Σ_j w_pos[i,j] * (y_pos[j] - x[i])
-    #        = (w_pos @ p_flat) - x_flat
-    V_plus  = (w_pos @ p_flat) - x_flat   # [N, D]  attraction
+    if encoder is not None:
+        with torch.no_grad():
+            fx = encoder(x_gen)   # [G, F]
+            fy = encoder(y_pos)   # [P, F]
+    else:
+        fx = x_flat
+        fy = p_flat
 
-    # V⁻(x) = Σ_j w_neg[i,j] * (y_neg[j] - x[i])
-    #        = (w_neg @ q_flat) - x_flat
-    V_minus = (w_neg @ q_flat) - x_flat   # [N, D]  repulsion
+    # Joint distance: gen -> [gen, pos]
+    feat_targets = torch.cat([fx, fy], dim=0)             # [G+P, F]
+    dist = torch.cdist(fx, feat_targets, p=2)             # [G, G+P]
 
-    V = V_plus - V_minus                   # [N, D]
+    # Self-masking
+    dist[:, :G].fill_diagonal_(float("inf"))
+
+    k = torch.exp(-dist / tau)                            # [G, G+P]
+
+    # Symmetric normalization
+    row_sum = k.sum(dim=-1, keepdim=True)                 # [G, 1]
+    col_sum = k.sum(dim=0,  keepdim=True)                 # [1, G+P]
+    nk = k / (row_sum * col_sum).clamp_min(1e-12).sqrt()  # [G, G+P]
+
+    nk_neg = nk[:, :G]                                    # [G, G]
+    nk_pos = nk[:, G:]                                    # [G, P]
+
+    s_neg = nk_neg.sum(dim=-1, keepdim=True)              # [G, 1]
+    s_pos = nk_pos.sum(dim=-1, keepdim=True)              # [G, 1]
+
+    V = (nk_pos * s_neg) @ p_flat - (nk_neg * s_pos) @ x_flat   # [G, D]
+
     return V.view_as(x_gen)
 
 
@@ -73,29 +97,19 @@ def drifting_loss(
     x_gen: Tensor,
     y_pos: Tensor,
     kernel: DriftKernel,
-    y_neg: Tensor | None = None,
 ) -> tuple[Tensor, dict]:
     """
-    Compute the drifting training loss.
-
-    L = ‖x − stopgrad(x + V(x))‖²
+    L = ||x - stopgrad(x + V(x))||^2
 
     Args:
-        x_gen:  [N, *] generated samples from f_θ(ε)
+        x_gen:  [N, *] generated samples from f_theta(eps)
         y_pos:  [P, *] real data samples (same class / task as x_gen)
         kernel: DriftKernel
-        y_neg:  [Q, *] negatives; defaults to x_gen (self-repulsion)
-
-    Returns:
-        loss:   scalar
-        info:   dict with diagnostic scalars
     """
-    if y_neg is None:
-        y_neg = x_gen
+    with torch.no_grad():
+        V      = compute_drift_field(x_gen, y_pos, kernel)
+        target = x_gen + V
 
-    V = compute_drift_field(x_gen, y_pos, y_neg, kernel)   # [N, *]
-
-    target = (x_gen + V).detach()   # stopgrad — no gradient through target
     loss = F.mse_loss(x_gen, target)
 
     with torch.no_grad():
@@ -105,7 +119,7 @@ def drifting_loss(
 
 
 # ---------------------------------------------------------------------------
-# CFG: mixed-negative drifting loss
+# CFG: mixed-positive drifting loss
 # ---------------------------------------------------------------------------
 
 def drifting_loss_cfg(
@@ -116,30 +130,15 @@ def drifting_loss_cfg(
     alpha: float,
 ) -> tuple[Tensor, dict]:
     """
-    Drifting loss with classifier-free guidance training (Section 4, paper).
+    CFG training: mixed positives q~ = (1-gamma)*p(|c) + gamma*p(|empty), gamma = 1 - 1/alpha.
 
-    Mixed negatives: q̃ = (1−γ)·q_θ(·|c) + γ·p_data(·|∅)
-    where γ = 1 − 1/α.
-
-    Args:
-        x_gen_cond:    [N, *] samples generated with class label
-        y_pos_cond:    [P, *] real data for this class
-        y_pos_uncond:  [U, *] unconditional real data (random classes)
-        kernel:        DriftKernel
-        alpha:         CFG scale (≥ 1)
+    Appends a gamma-fraction of unconditional real data to y_pos_cond so the
+    kernel is attracted toward both conditional and unconditional real data.
     """
-    gamma = 1.0 - 1.0 / alpha
+    gamma    = 1.0 - 1.0 / alpha
+    n_uncond = max(1, int(x_gen_cond.shape[0] * gamma))
 
-    # Build mixed negatives: gamma fraction from unconditional real data,
-    # (1-gamma) fraction from the generated batch.
-    N = x_gen_cond.shape[0]
-    n_uncond = max(1, int(N * gamma))
-    n_cond   = N - n_uncond
+    idx         = torch.randperm(y_pos_uncond.shape[0], device=x_gen_cond.device)[:n_uncond]
+    y_pos_mixed = torch.cat([y_pos_cond, y_pos_uncond[idx]], dim=0)
 
-    idx_uncond = torch.randperm(y_pos_uncond.shape[0], device=x_gen_cond.device)[:n_uncond]
-    y_neg_mixed = torch.cat([
-        x_gen_cond[:n_cond],
-        y_pos_uncond[idx_uncond],
-    ], dim=0)
-
-    return drifting_loss(x_gen_cond, y_pos_cond, kernel, y_neg=y_neg_mixed)
+    return drifting_loss(x_gen_cond, y_pos_mixed, kernel)

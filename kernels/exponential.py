@@ -15,7 +15,7 @@ class ExponentialKernel(DriftKernel):
     If encoder is None, kernel is computed directly in raw input space.
     """
 
-    def __init__(self, encoder: nn.Module | None = None, tau: float = 1.0):
+    def __init__(self, encoder: nn.Module | None = None, tau: float = 0.05):
         super().__init__()
         self.encoder = encoder
         self.tau = tau
