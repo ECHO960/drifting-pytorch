@@ -1,0 +1,45 @@
+name: imagenet_b2
+
+model:
+  type: dit
+  variant: B/2          # patch_size=2 in 32x32 latent → 256 tokens
+  in_channels: 4
+  num_classes: 1000
+  pretrained: null      # path to DiT-B-2.pt, or null to train from scratch
+
+vae:
+  model_id: "stabilityai/sd-vae-ft-ema"
+  latent_scale: 0.18215
+
+encoder:
+  type: dinov2_b        # frozen DINOv2 ViT-B/14 for kernel feature space
+  freeze: true
+
+kernel:
+  type: exponential
+  tau: 1.0
+
+data:
+  type: imagenet
+  root: data/imagenet
+  image_size: 256
+  n_classes_per_batch: 8
+  n_samples_per_class: 64   # N_pos = N_neg = 64 per class
+
+training:
+  steps: 400_000
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_steps: 5_000
+  ema_decay: 0.9999
+  precision: bf16
+  ckpt_every: 10_000
+  log_every: 100
+
+cfg:
+  enabled: true
+  alpha_max: 4.0
+  uncond_prob: 0.1        # fraction of steps with dropped label
+
+output_dir: checkpoints/imagenet_b2

@@ -1,0 +1,45 @@
+name: imagenet_l2
+
+model:
+  type: dit
+  variant: L/2
+  in_channels: 4
+  num_classes: 1000
+  pretrained: null      # checkpoints/pretrained/DiT-XL-2-256x256.pt for warm-start
+
+vae:
+  model_id: "stabilityai/sd-vae-ft-ema"
+  latent_scale: 0.18215
+
+encoder:
+  type: dinov2_l        # DINOv2 ViT-L/14 for higher quality features
+  freeze: true
+
+kernel:
+  type: exponential
+  tau: 1.0
+
+data:
+  type: imagenet
+  root: data/imagenet
+  image_size: 256
+  n_classes_per_batch: 8
+  n_samples_per_class: 64
+
+training:
+  steps: 400_000
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_steps: 5_000
+  ema_decay: 0.9999
+  precision: bf16
+  ckpt_every: 10_000
+  log_every: 100
+
+cfg:
+  enabled: true
+  alpha_max: 4.0
+  uncond_prob: 0.1
+
+output_dir: checkpoints/imagenet_l2

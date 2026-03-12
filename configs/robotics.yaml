@@ -1,0 +1,47 @@
+name: robotics
+
+model:
+  type: dit
+  variant: S/1           # small DiT, patch_size=1 for 1-D action tokens
+  in_channels: 1         # action_dim treated as channel dim
+  num_classes: -1        # -1 = task ID as class label (set at runtime from dataset)
+  pretrained: null
+
+vae:
+  enabled: false         # no VAE for low-dim actions
+
+encoder:
+  type: identity         # kernel in raw action space (low-dim)
+  freeze: true
+
+kernel:
+  type: exponential
+  tau: 0.5               # tighter kernel for low-dim action space
+
+data:
+  type: robotics
+  root: data/robotics
+  zarr_path: pusht.zarr  # relative to data.root; override per task
+  obs_key: obs
+  action_key: action
+  horizon: 16            # action sequence length
+  pad_before: 1
+  pad_after: 7
+  n_tasks_per_batch: 4
+  n_samples_per_task: 32
+
+training:
+  steps: 100_000
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_steps: 1_000
+  ema_decay: 0.999
+  precision: fp32        # low-dim; fp32 is fine
+  ckpt_every: 5_000
+  log_every: 50
+
+cfg:
+  enabled: false         # task-conditional only, no CFG for robotics
+
+output_dir: checkpoints/robotics
