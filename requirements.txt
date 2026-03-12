@@ -1,13 +1,25 @@
+# Core
 torch>=2.2.0
 torchvision>=0.17.0
-diffusers>=0.27.0
-transformers>=4.40.0
-timm>=0.9.0
-zarr>=2.17.0
+einops>=0.7.0
 numpy>=1.24.0
 Pillow>=10.0.0
+
+# Config
 omegaconf>=2.3.0
-einops>=0.7.0
-tqdm>=4.66.0
+
+# Pretrained models
+diffusers>=0.27.0          # SD VAE
+transformers>=4.40.0
+timm>=0.9.0
 accelerate>=0.28.0
-clean-fid>=0.1.35   # FID evaluation
+
+# Data
+zarr>=2.17.0               # robotics Zarr format
+
+# Evaluation
+clean-fid>=0.1.35          # FID computation
+tqdm>=4.66.0
+
+# Optional: logging
+# wandb>=0.16.0

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (too large for git)
+data/imagenet/
+data/robotics/
+data/openx/
+
+# Checkpoints & outputs
+checkpoints/
+samples/
+eval_samples/
+wandb/
+runs/
+
+# HuggingFace / torch.hub cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
