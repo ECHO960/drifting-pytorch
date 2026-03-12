@@ -4,32 +4,6 @@
 
 Unofficial PyTorch reproduction of [**Generative Modeling via Drifting**](https://arxiv.org/abs/2602.04770) (Deng et al., arXiv 2026), with a [DiT](https://arxiv.org/abs/2212.09748) backbone and support for both image generation and robot action generation.
 
----
-
-## What is Drifting?
-
-Drifting trains a **single-step generator** `x = f_θ(ε)` by evolving the generated distribution toward the data distribution during training — no SDE, no ODE, no iterative denoising at inference.
-
-The core idea is a **drift field** V that attracts generated samples toward real data and repels them from each other:
-
-```
-V(x) = V⁺_p(x) − V⁻_q(x)
-
-V⁺_p(x) = Σ_j k(x, y⁺_j) · (y⁺_j − x)   # attraction to real data
-V⁻_q(x) = Σ_j k(x, y⁻_j) · (y⁻_j − x)   # repulsion from generated samples
-
-Loss = ‖x − stopgrad(x + V(x))‖²
-```
-
-where `k(x, y) = exp(−‖φ(x) − φ(y)‖ / τ)` is an exponential kernel in DINOv2 feature space.
-
-At equilibrium V → 0, which means the generator has matched the data distribution. **1 NFE at inference.**
-
-| Method | NFE | FID (ImageNet 256) |
-|--------|-----|--------------------|
-| DiT-XL/2 | 250 | 2.27 |
-| SiT-XL/2 + REPA | 250 | 1.42 |
-| **Drifting L/2** | **1** | **1.54** |
 
 ---
 
