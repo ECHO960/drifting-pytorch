@@ -1,5 +1,7 @@
 # Generative Modeling via Drifting
 
+> ⚠️ **Work in Progress** — implementation is complete but not yet validated experimentally. Results may differ from the paper.
+
 Unofficial PyTorch reproduction of [**Generative Modeling via Drifting**](https://arxiv.org/abs/2602.04770) (Deng et al., arXiv 2026), with a [DiT](https://arxiv.org/abs/2212.09748) backbone and support for both image generation and robot action generation.
 
 ---
@@ -188,15 +190,3 @@ class MyKernel(DriftKernel):
 - **Class-stratified batching**: N_pos ≥ 64 per class per batch is critical (FID degrades 75% with N_pos=1). `ClassStratifiedSampler` guarantees this.
 - **Frozen DINOv2**: kernel similarity is computed in DINOv2 feature space, never fine-tuned.
 
----
-
-## Citation
-
-```bibtex
-@article{deng2026drifting,
-  title   = {Generative Modeling via Drifting},
-  author  = {Deng, Mingyang and Li, He and Li, Tianhong and Du, Yilun and He, Kaiming},
-  journal = {arXiv preprint arXiv:2602.04770},
-  year    = {2026}
-}
-```
