@@ -69,7 +69,7 @@ def generate_batch(model, n: int, num_classes: int, cfg_scale: float,
     labels = torch.randint(0, num_classes, (n,), device=device)
     eps    = torch.randn(n, 3, image_size, image_size, device=device, dtype=dtype)
     alpha  = torch.full((n,), cfg_scale, device=device, dtype=dtype)
-    imgs   = model(eps, y=labels, alpha=alpha)   # [N, 3, H, W]  in [-1, 1]
+    imgs   = model(eps, label=labels, alpha=alpha)   # [N, 3, H, W]  in [-1, 1]
     return imgs.float().clamp(-1, 1)
 
 

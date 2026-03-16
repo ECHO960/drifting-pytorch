@@ -48,7 +48,7 @@ def sample(
     if class_id is not None:
         labels = torch.full((n,), class_id, dtype=torch.long, device=device)
 
-    x = model(eps, y=labels)   # [n, C, H, W]  — 1 NFE
+    x = model(eps, label=labels)   # [n, C, H, W]  — 1 NFE
 
     if vae is not None:
         images = vae.decode(x)   # [n, 3, 256, 256]

@@ -40,10 +40,10 @@ training:
 cfg:
   enabled: true
   alpha_max: 4.0
-  uncond_prob: 0.1
 
 logging:
   wandb: true
   project: drifting-imagenet
+  fid_samples: 2048     # samples for FID at each eval step (50000 for final eval)
 
 output_dir: checkpoints/imagenet_l2

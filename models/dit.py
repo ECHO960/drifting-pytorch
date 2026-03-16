@@ -188,24 +188,14 @@ class ScalarEmbedder(nn.Module):
 
 
 class LabelEmbedder(nn.Module):
-    """Class label → embedding with optional CFG dropout."""
+    """Class label → embedding."""
 
-    def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float = 0.0):
+    def __init__(self, num_classes: int, hidden_size: int):
         super().__init__()
-        use_cfg          = dropout_prob > 0
-        self.embedding   = nn.Embedding(num_classes + (1 if use_cfg else 0), hidden_size)
-        self.num_classes  = num_classes
-        self.dropout_prob = dropout_prob
+        self.embedding  = nn.Embedding(num_classes, hidden_size)
+        self.num_classes = num_classes
 
-    def token_drop(self, labels: Tensor) -> Tensor:
-        drop = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        return torch.where(drop, torch.full_like(labels, self.num_classes), labels)
-
-    def forward(self, labels: Tensor, force_drop: bool = False) -> Tensor:
-        if self.training and self.dropout_prob > 0:
-            labels = self.token_drop(labels)
-        elif force_drop:
-            labels = torch.full_like(labels, self.num_classes)
+    def forward(self, labels: Tensor) -> Tensor:
         return self.embedding(labels)
 
 
@@ -306,53 +296,61 @@ class DiT(nn.Module):
     Modernized DiT generator for the Drifting model.
 
     Conditioning enters via two paths simultaneously:
-      1. adaLN-zero: c modulates shift/scale/gate of every norm layer.
-      2. In-context tokens: c is projected to n_ctx_tokens prepended to the sequence,
-         so the transformer can attend directly to the conditioning information.
+      1. adaLN-zero: combined c vector modulates shift/scale/gate of every norm layer.
+      2. Separate in-context token banks: each conditioning variable (class label, α)
+         has its own learnable token bank. The scalar embedding is broadcast-added to
+         the bank and the result is prepended to the patch sequence, letting the
+         transformer attend directly and independently to each conditioning signal.
 
     2D RoPE is applied only to image-patch tokens; context tokens are position-free.
     """
 
     def __init__(
         self,
-        variant:          str   = "B/16",
-        input_size:       int   = 256,
-        in_channels:      int   = 3,
-        num_classes:      int   = 1000,
-        cfg_dropout_prob: float = 0.0,
-        learn_sigma:      bool  = False,
-        n_ctx_tokens:     int   = 1,
+        variant:          str  = "B/16",
+        input_size:       int  = 256,
+        in_channels:      int  = 3,
+        num_classes:      int  = 1000,
+        use_cfg:          bool = False,
+        learn_sigma:      bool = False,
+        num_class_tokens: int  = 8,
+        num_cfg_tokens:   int  = 4,
     ):
         super().__init__()
         cfg = _CONFIGS[variant]
-        self.patch_size   = cfg["patch_size"]
-        self.hidden_size  = cfg["hidden_size"]
-        self.num_heads    = cfg["num_heads"]
-        self.depth        = cfg["depth"]
-        self.in_channels  = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.input_size   = input_size
-        self.grid_size    = input_size // self.patch_size
-        self.num_patches  = self.grid_size ** 2
-        self.n_ctx_tokens = n_ctx_tokens
+        self.patch_size       = cfg["patch_size"]
+        self.hidden_size      = cfg["hidden_size"]
+        self.num_heads        = cfg["num_heads"]
+        self.depth            = cfg["depth"]
+        self.in_channels      = in_channels
+        self.out_channels     = in_channels * 2 if learn_sigma else in_channels
+        self.input_size       = input_size
+        self.grid_size        = input_size // self.patch_size
+        self.num_patches      = self.grid_size ** 2
+        self.num_class_tokens = num_class_tokens
+        self.num_cfg_tokens   = num_cfg_tokens if use_cfg else 0
+        self.n_ctx_tokens     = num_class_tokens + self.num_cfg_tokens
 
         # Patch embedding
         self.x_embedder = nn.Linear(
             self.patch_size * self.patch_size * in_channels, self.hidden_size, bias=True
         )
 
-        # Conditioning → adaLN vector c [B, D]
-        self.cond_bias = nn.Parameter(torch.zeros(self.hidden_size))
+        # Conditioning embedders → scalar [B, D] used for adaLN and token bank bias
+        self.cond_bias  = nn.Parameter(torch.zeros(self.hidden_size))
         self.y_embedder = (
-            LabelEmbedder(num_classes, self.hidden_size, cfg_dropout_prob)
-            if num_classes > 0 else None
+            LabelEmbedder(num_classes, self.hidden_size) if num_classes > 0 else None
         )
-        self.alpha_embedder = (
-            ScalarEmbedder(self.hidden_size) if cfg_dropout_prob > 0 else None
-        )
+        self.alpha_embedder = ScalarEmbedder(self.hidden_size) if use_cfg else None
 
-        # In-context conditioning tokens
-        self.ctx_proj = nn.Linear(self.hidden_size, n_ctx_tokens * self.hidden_size, bias=True)
+        # Per-conditioning learnable token banks
+        # Each bank: [num_tokens, D], init ~ N(0, 1/√D) following imfDiT
+        std = self.hidden_size ** -0.5
+        self.class_token_bank = nn.Parameter(torch.empty(num_class_tokens, self.hidden_size).normal_(std=std))
+        self.cfg_token_bank   = (
+            nn.Parameter(torch.empty(num_cfg_tokens, self.hidden_size).normal_(std=std))
+            if use_cfg else None
+        )
 
         # Transformer
         self.blocks = nn.ModuleList([
@@ -396,17 +394,15 @@ class DiT(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        x:                Tensor,
-        y:                Tensor | None = None,
-        force_drop_label: bool          = False,
-        alpha:            Tensor | None = None,
+        x:     Tensor,
+        label: Tensor | None = None,
+        alpha: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
             x:     [B, C, H, W] input noise ε
-            y:     [B] integer class labels (None → unconditional)
-            force_drop_label: force unconditional at inference
-            alpha: [B] CFG guidance scale α ≥ 1
+            label: [B] integer class labels (None → unconditional)
+            alpha: [B] CFG guidance scale α ≥ 1 (only used when use_cfg=True)
         Returns:
             [B, C, H, W]
         """
@@ -416,16 +412,25 @@ class DiT(nn.Module):
         tokens = self.patchify(x)           # [B, T, p²C]
         tokens = self.x_embedder(tokens)    # [B, T, D]
 
-        # Build adaLN conditioning vector c [B, D]
-        c = self.cond_bias.unsqueeze(0).expand(B, -1)
-        if self.y_embedder is not None and y is not None:
-            c = c + self.y_embedder(y, force_drop=force_drop_label)
-        if self.alpha_embedder is not None and alpha is not None:
-            c = c + self.alpha_embedder(alpha.float())
+        # Compute scalar embeddings for each conditioning variable
+        cls_emb   = self.y_embedder(label) if (self.y_embedder is not None and label is not None) \
+                    else torch.zeros(B, self.hidden_size, device=x.device)
+        alpha_emb = self.alpha_embedder(1 - 1 / alpha.float()) \
+                    if (self.alpha_embedder is not None and alpha is not None) \
+                    else torch.zeros(B, self.hidden_size, device=x.device)
 
-        # Prepend in-context conditioning tokens
-        ctx    = self.ctx_proj(c).view(B, self.n_ctx_tokens, self.hidden_size)
-        tokens = torch.cat([ctx, tokens], dim=1)   # [B, n_ctx + T, D]
+        # adaLN conditioning vector c [B, D]
+        c = self.cond_bias.unsqueeze(0).expand(B, -1) + cls_emb + alpha_emb
+
+        # In-context token banks: bank [num_tokens, D] + emb [B, 1, D] → [B, num_tokens, D]
+        class_ctx = self.class_token_bank.unsqueeze(0) + cls_emb.unsqueeze(1)
+        if self.cfg_token_bank is not None:
+            cfg_ctx = self.cfg_token_bank.unsqueeze(0) + alpha_emb.unsqueeze(1)
+            ctx = torch.cat([class_ctx, cfg_ctx], dim=1)   # [B, 8+4, D]
+        else:
+            ctx = class_ctx                                 # [B, 8, D]
+
+        tokens = torch.cat([ctx, tokens], dim=1)            # [B, n_ctx + T, D]
 
         # 2D RoPE for image tokens
         head_dim = self.hidden_size // self.num_heads
@@ -449,7 +454,9 @@ class DiT(nn.Module):
             input_size=cfg.get("input_size", 256),
             in_channels=cfg.in_channels,
             num_classes=cfg.get("num_classes", 1000),
-            cfg_dropout_prob=cfg.get("cfg_dropout_prob", 0.0),
+            use_cfg=cfg.get("use_cfg", False),
+            num_class_tokens=cfg.get("num_class_tokens", 8),
+            num_cfg_tokens=cfg.get("num_cfg_tokens", 4),
         )
 
     def load_pretrained(self, path: str):

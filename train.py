@@ -16,9 +16,14 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+import torchvision.transforms.functional as TF
+import torchvision.utils as vutils
 
 import torch
 import torch.distributed as dist
@@ -66,10 +71,18 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float):
         ema_p.mul_(decay).add_(p.detach().cpu(), alpha=1 - decay)
 
 
+def _hdfs_upload(local_path: str, hdfs_path: str):
+    """Upload a local file to HDFS using the hdfs CLI."""
+    subprocess.run(
+        ["hdfs", "dfs", "-put", "-f", local_path, hdfs_path],
+        check=True,
+    )
+
+
 def save_checkpoint(out_dir: str, epoch: int, step: int, model, ema, optimizer, rank: int):
     if not is_main(rank):
         return
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
     state = {
         "epoch":     epoch,
         "step":      step,
@@ -77,13 +90,32 @@ def save_checkpoint(out_dir: str, epoch: int, step: int, model, ema, optimizer, 
         "ema":       ema.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
-    torch.save(state, os.path.join(out_dir, f"ckpt_step{step:07d}.pt"))
-    torch.save(state, os.path.join(out_dir, "last.pt"))
-    log(rank, f"[ckpt] saved step {step}")
+
+    use_hdfs = out_dir.startswith("hdfs")
+
+    if use_hdfs:
+        # Save to a local temp file, upload to HDFS, then clean up.
+        with tempfile.TemporaryDirectory() as tmp:
+            for filename in (f"ckpt_step{step:07d}.pt", "last.pt"):
+                local = os.path.join(tmp, filename)
+                torch.save(state, local)
+                _hdfs_upload(local, f"{out_dir}/{filename}")
+    else:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        torch.save(state, os.path.join(out_dir, f"ckpt_step{step:07d}.pt"))
+        torch.save(state, os.path.join(out_dir, "last.pt"))
+
+    log(rank, f"[ckpt] saved step {step} → {out_dir}")
 
 
 def load_checkpoint(path: str, model, ema, optimizer, device):
-    state = torch.load(path, map_location=device, weights_only=False)
+    if path.startswith("hdfs"):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "ckpt.pt")
+            subprocess.run(["hdfs", "dfs", "-get", path, local], check=True)
+            state = torch.load(local, map_location=device, weights_only=False)
+    else:
+        state = torch.load(path, map_location=device, weights_only=False)
     raw_model = model.module if isinstance(model, DDP) else model
     raw_model.load_state_dict(state["model"])
     ema.load_state_dict(state["ema"])
@@ -111,10 +143,9 @@ def autocast(precision: str):
 # ---------------------------------------------------------------------------
 
 def build_model(cfg, device):
-    # Wire cfg_dropout_prob from training cfg into model cfg before from_config
     model_cfg = cfg.model
-    if cfg.get("cfg") and cfg.cfg.get("uncond_prob") is not None:
-        model_cfg = OmegaConf.merge(model_cfg, {"cfg_dropout_prob": cfg.cfg.uncond_prob})
+    if cfg.get("cfg") and cfg.cfg.get("enabled"):
+        model_cfg = OmegaConf.merge(model_cfg, {"use_cfg": True})
     model = DiT.from_config(model_cfg)
     if cfg.model.get("pretrained"):
         model.load_pretrained(cfg.model.pretrained)
@@ -185,7 +216,7 @@ def train_step_imagenet(
     alpha_t = torch.full((N,), alpha, device=device)
 
     with autocast(precision):
-        x_gen = model(eps, y=labels_pos, alpha=alpha_t)
+        x_gen = model(eps, label=labels_pos, alpha=alpha_t)
         if use_cfg:
             loss, info = drifting_loss_cfg(x_gen, images_pos.detach(), images_unc.detach(), kernel, alpha, labels=labels_pos)
         else:
@@ -211,7 +242,7 @@ def train_step_robotics(batch, model, kernel, device, precision):
     eps         = torch.randn_like(x_2d)
 
     with autocast(precision):
-        x_gen   = model(eps, y=labels)            # [N, D, 1, 1]
+        x_gen   = model(eps, label=labels)            # [N, D, 1, 1]
         x_gen_f = x_gen.flatten(1)                # [N, D]
         y_pos_f = actions_flat.detach()
         loss, info = drifting_loss(x_gen_f, y_pos_f, kernel)
@@ -244,7 +275,7 @@ def evaluate(eval_loader, model, kernel, cfg, device, precision, eval_batches: i
         eps     = torch.randn_like(images_pos)
         alpha_t = torch.full((N,), alpha, device=device)
         with autocast(precision):
-            x_gen = raw_model(eps, y=labels_pos, alpha=alpha_t)
+            x_gen = raw_model(eps, label=labels_pos, alpha=alpha_t)
             if cfg.cfg.enabled:
                 _, info = drifting_loss_cfg(x_gen, images_pos, images_unc, kernel, alpha, labels=labels_pos)
             else:
@@ -254,6 +285,72 @@ def evaluate(eval_loader, model, kernel, cfg, device, precision, eval_batches: i
     raw_model.train()
     n = max(len(losses), 1)
     return {"eval_loss": sum(losses) / n, "eval_V_norm": sum(v_norms) / n}
+
+
+# ---------------------------------------------------------------------------
+# FID evaluation: generate samples + compute FID (rank 0 only)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_and_fid(
+    ema:       nn.Module,
+    cfg,
+    device,
+    precision: str,
+    n_samples: int,
+) -> tuple[float, any]:
+    """
+    Generate n_samples with the EMA model, compute FID against ImageNet val,
+    and return (fid_score, 4×4 wandb.Image grid).
+    Runs on rank 0 only; temporarily moves EMA to GPU.
+    """
+    from cleanfid import fid as cleanfid
+
+    use_cfg   = cfg.cfg.enabled
+    alpha_val = cfg.cfg.alpha_max if use_cfg else 1.0
+    H = W     = cfg.model.input_size
+    C         = cfg.model.in_channels
+    gen_bs    = 64
+
+    ema.to(device).eval()
+    grid_imgs = []
+
+    with tempfile.TemporaryDirectory() as gen_dir:
+        saved = 0
+        while saved < n_samples:
+            bs      = min(gen_bs, n_samples - saved)
+            y       = torch.randint(0, 1000, (bs,), device=device)
+            eps     = torch.randn(bs, C, H, W, device=device)
+            alpha_t = torch.full((bs,), alpha_val, device=device) if use_cfg else None
+            with autocast(precision):
+                imgs = ema(eps, label=y, alpha=alpha_t).clamp(-1, 1).cpu()
+
+            # Collect up to 16 images for the sample grid
+            need = max(0, 16 - len(grid_imgs))
+            if need > 0:
+                grid_imgs.append(imgs[:need])
+
+            # Save as PNG for FID (convert from [-1,1] to [0,255])
+            for i in range(bs):
+                img_u8 = ((imgs[i] + 1) / 2 * 255).to(torch.uint8)
+                TF.to_pil_image(img_u8).save(f"{gen_dir}/{saved + i:05d}.png")
+            saved += bs
+
+        fid_score = cleanfid.compute_fid(
+            gen_dir,
+            dataset_name="imagenet_val",
+            dataset_res=H,
+            device=device,
+            verbose=False,
+        )
+
+    ema.cpu()
+
+    # Build 4×4 image grid
+    grid_tensor = torch.cat(grid_imgs, dim=0)[:16]          # [16, C, H, W] in [-1,1]
+    grid = vutils.make_grid((grid_tensor + 1) / 2, nrow=4, padding=2)  # [C, H', W'] in [0,1]
+
+    return fid_score, grid
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +366,7 @@ def train(cfg_path: str, smoke_test: bool = False, resume: str | None = None):
         cfg.training.eval_every   = 4
         cfg.training.eval_batches = 2
         cfg.training.warmup_steps = 0
+        cfg.logging.fid_samples   = 16
 
     # Distributed setup
     rank, world_size, local_rank = setup_dist()
@@ -329,6 +427,27 @@ def train(cfg_path: str, smoke_test: bool = False, resume: str | None = None):
     data_iter  = iter(loader)
     epoch      = 0
     loss_ema   = None   # exponential moving avg of loss for spike detection
+
+    # Step-0 eval: baseline FID before any training
+    if eval_loader is not None and start_step == 0:
+        dist.barrier()
+        if is_main(rank):
+            n_fid = cfg.get("logging", {}).get("fid_samples", 2048)
+            fid_score, grid = generate_and_fid(ema, cfg, device, precision, n_fid)
+            log(rank, f"[fid]  step=0 | FID={fid_score:.3f} (n={n_fid})")
+            if use_wandb:
+                import numpy as np
+                wandb.log(
+                    {
+                        "fid":     fid_score,
+                        "samples": wandb.Image(
+                            np.transpose(grid.numpy(), (1, 2, 0)),
+                            caption=f"step 0 | FID {fid_score:.1f}",
+                        ),
+                    },
+                    step=0,
+                )
+        dist.barrier()
 
     for step in range(start_step, cfg.training.steps):
         # Restart loader when exhausted; update sampler epoch for DDP shuffling
@@ -403,8 +522,28 @@ def train(cfg_path: str, smoke_test: bool = False, resume: str | None = None):
                     f"eval_V_norm={eval_info['eval_V_norm']:.4f}",
                     flush=True,
                 )
+
+            # FID + sample grid (rank 0 only; other ranks wait at barrier)
+            dist.barrier()
+            if is_main(rank):
+                n_fid     = cfg.get("logging", {}).get("fid_samples", 2048)
+                fid_score, grid = generate_and_fid(ema, cfg, device, precision, n_fid)
+                print(f"[fid]  step={step+1} | FID={fid_score:.3f} (n={n_fid})", flush=True)
                 if use_wandb:
-                    wandb.log({"eval_loss": eval_info["eval_loss"], "eval_V_norm": eval_info["eval_V_norm"]}, step=step)
+                    import numpy as np
+                    wandb.log(
+                        {
+                            "eval_loss":   eval_info["eval_loss"],
+                            "eval_V_norm": eval_info["eval_V_norm"],
+                            "fid":         fid_score,
+                            "samples":     wandb.Image(
+                                np.transpose(grid.numpy(), (1, 2, 0)),
+                                caption=f"step {step+1} | FID {fid_score:.1f}",
+                            ),
+                        },
+                        step=step,
+                    )
+            dist.barrier()
 
     dist.barrier()
     save_checkpoint(out_dir, epoch, cfg.training.steps, model, ema, optimizer, rank)
