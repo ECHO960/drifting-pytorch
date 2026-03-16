@@ -2,14 +2,11 @@ name: imagenet_b2
 
 model:
   type: dit
-  variant: B/2          # patch_size=2 in 32x32 latent → 256 tokens
-  in_channels: 4
+  variant: B/16         # patch_size=16 on 256×256 pixels → 256 tokens
+  input_size: 256
+  in_channels: 3
   num_classes: 1000
-  pretrained: null      # path to DiT-B-2.pt, or null to train from scratch
-
-vae:
-  model_id: "stabilityai/sd-vae-ft-ema"
-  latent_scale: 0.18215
+  pretrained: null      # path to a pretrained DiT checkpoint, or null to train from scratch
 
 encoder:
   type: dinov2_b        # frozen DINOv2 ViT-B/14 for kernel feature space
@@ -21,10 +18,13 @@ kernel:
 
 data:
   type: imagenet
-  root: data/imagenet
+  hf_streaming: true                      # stream from HuggingFace Hub; no local copy needed
+  hf_dataset_id: ILSVRC/imagenet-1k       # requires HF account + accepted license
+  shuffle_buffer: 10_000
+  # root: data/imagenet                   # set this instead of hf_streaming for local data
   image_size: 256
-  n_classes_per_batch: 8
-  n_samples_per_class: 64   # N_pos = N_neg = 64 per class
+  n_samples_per_class: 64   # positives per step
+  n_uncond: 32              # uncond negatives per step (total batch = 96)
 
 training:
   steps: 400_000
@@ -41,5 +41,9 @@ cfg:
   enabled: true
   alpha_max: 4.0
   uncond_prob: 0.1        # fraction of steps with dropped label
+
+logging:
+  wandb: false
+  project: drifting-imagenet
 
 output_dir: checkpoints/imagenet_b2

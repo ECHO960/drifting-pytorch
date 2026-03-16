@@ -23,8 +23,13 @@ data/openx/
 checkpoints/
 samples/
 eval_samples/
+eval_out/
 wandb/
 runs/
+logs/
+*.log
+*.pt
+*.pth
 
 # HuggingFace / torch.hub cache
 .cache/

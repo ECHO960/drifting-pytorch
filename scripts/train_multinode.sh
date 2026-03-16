@@ -23,7 +23,7 @@ CONFIG=${1:-configs/imagenet_l2.yaml}
 shift || true
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-29500}
+MASTER_PORT=${MASTER_PORT:-54993}
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 NGPU_PER_NODE=${NGPU_PER_NODE:-$(python -c "import torch; print(torch.cuda.device_count())")}

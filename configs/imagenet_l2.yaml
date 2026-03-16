@@ -2,14 +2,11 @@ name: imagenet_l2
 
 model:
   type: dit
-  variant: L/2
-  in_channels: 4
+  variant: L/16         # patch_size=16 on 256×256 pixels → 256 tokens
+  input_size: 256
+  in_channels: 3
   num_classes: 1000
-  pretrained: null      # checkpoints/pretrained/DiT-XL-2-256x256.pt for warm-start
-
-vae:
-  model_id: "stabilityai/sd-vae-ft-ema"
-  latent_scale: 0.18215
+  pretrained: null      # path to a pretrained DiT checkpoint, or null to train from scratch
 
 encoder:
   type: dinov2_l        # DINOv2 ViT-L/14 for higher quality features
@@ -17,29 +14,36 @@ encoder:
 
 kernel:
   type: exponential
-  tau: 0.05
+  taus: [0.02, 0.05, 0.2]   # multiple temperatures summed per §A.6
 
 data:
   type: imagenet
-  root: data/imagenet
+  root: /mnt/bn/arnold-tiktok-search-raw-rel/chunhui.liu/datasets/imagenet-hf
   image_size: 256
-  n_classes_per_batch: 8
-  n_samples_per_class: 64
+  n_samples_per_class: 96   # positives per step
+  n_uncond: 48               # uncond negatives per step (total batch = 192)
+  num_workers: 12
 
 training:
   steps: 400_000
-  lr: 1.0e-4
-  weight_decay: 0.0
+  lr: 1e-4
+  weight_decay: 1e-2
   grad_clip: 1.0
-  warmup_steps: 5_000
+  warmup_steps: 10_000
   ema_decay: 0.9999
   precision: bf16
-  ckpt_every: 10_000
-  log_every: 100
+  ckpt_every: 20_000
+  log_every: 20
+  eval_every: 10_000    # eval every N steps
+  eval_batches: 100    # number of eval batches
 
 cfg:
   enabled: true
   alpha_max: 4.0
   uncond_prob: 0.1
+
+logging:
+  wandb: true
+  project: drifting-imagenet
 
 output_dir: checkpoints/imagenet_l2

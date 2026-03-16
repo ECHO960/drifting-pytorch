@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -35,8 +36,11 @@ class FrozenEncoder(nn.Module):
         return self
 
     def forward(self, x: Tensor) -> Tensor:
-        with torch.no_grad():
-            return self._forward(x)
+        # Don't wrap with no_grad — caller controls whether grad flows through input.
+        # Encoder params are frozen (requires_grad=False) so they won't accumulate grads,
+        # but gradients w.r.t. x_gen still flow back through the encoder.
+        # Use gradient checkpointing when grad is needed to avoid storing all activations.
+        return self._forward(x)
 
     def _forward(self, x: Tensor) -> Tensor:
         raise NotImplementedError
@@ -57,7 +61,10 @@ class DINOv2Encoder(FrozenEncoder):
         self.out_dim = backbone.embed_dim
 
     def _forward(self, x: Tensor) -> Tensor:
-        # DINOv2 expects images in [0,1] or [-1,1] (224×224 optimal, but flexible)
+        # DINOv2 patch size = 14; input must be a multiple of 14.
+        # Resize to 224×224 (= 16×14, DINOv2's native resolution).
+        if x.shape[-1] != 224 or x.shape[-2] != 224:
+            x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False)
         return self.backbone(x)     # CLS token: [N, F]
 
 

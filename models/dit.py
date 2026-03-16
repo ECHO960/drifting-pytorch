@@ -1,18 +1,21 @@
 """
-DiT (Diffusion Transformer) backbone for the Drifting generator.
+DiT backbone for the Drifting generator — modernized architecture.
 
-Architecture follows Peebles & Xie 2022 (arXiv 2212.09748).
-Pretrained DiT weights can be loaded; the timestep embedding is kept
-for weight compatibility but clamped to t=0 (unused in drifting).
+Upgrades vs. original DiT (Peebles & Xie 2022):
+  - RMSNorm    instead of LayerNorm (no affine params; adaLN provides scale/shift)
+  - SwiGLU     instead of GELU MLP
+  - 2D RoPE    applied to Q, K of image tokens (context tokens have no positional bias)
+  - QK-Norm    (RMSNorm on Q and K before scaled dot-product attention)
+  - adaLN-zero on all tokens (image + in-context conditioning)
+  - In-context conditioning tokens prepended to the patch sequence
 
-Variants (patch_size refers to the spatial dimension in latent space):
-  S/1, S/2, B/1, B/2, L/2, XL/2  — matching original DiT naming.
+Maps noise ε [B, C, H, W] + class label → generated sample [B, C, H, W].
+No diffusion timestep — a learned bias (cond_bias) anchors the conditioning.
 """
 
 from __future__ import annotations
 
 import math
-from functools import partial
 
 import torch
 import torch.nn as nn
@@ -22,47 +25,176 @@ from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# RMSNorm (no learnable parameters — adaLN handles scale/shift)
 # ---------------------------------------------------------------------------
 
-def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+
+# ---------------------------------------------------------------------------
+# 2D axial RoPE
+# ---------------------------------------------------------------------------
+
+def _rope_1d(
+    seq_len: int, head_dim: int, base: float = 10000.0, device=None
+) -> tuple[Tensor, Tensor]:
+    """(cos, sin) each [seq_len, head_dim] for 1-D RoPE."""
+    assert head_dim % 2 == 0
+    half  = head_dim // 2
+    theta = base ** (-torch.arange(0, half, dtype=torch.float32, device=device) / half)
+    pos   = torch.arange(seq_len, dtype=torch.float32, device=device)
+    freqs = torch.outer(pos, theta)                       # [seq_len, half]
+    cos   = torch.cat([freqs.cos(), freqs.cos()], dim=-1) # [seq_len, head_dim]
+    sin   = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
+    return cos, sin
+
+
+def build_2d_rope(
+    grid_h: int, grid_w: int, head_dim: int, device=None
+) -> tuple[Tensor, Tensor]:
+    """
+    Axial 2D RoPE: first head_dim/2 dims encode row, last head_dim/2 encode col.
+    Returns (cos, sin) each [grid_h * grid_w, head_dim].
+    """
+    half     = head_dim // 2
+    cos_h, sin_h = _rope_1d(grid_h, half, device=device)  # [H, half]
+    cos_w, sin_w = _rope_1d(grid_w, half, device=device)  # [W, half]
+    row_ids  = torch.arange(grid_h, device=device).repeat_interleave(grid_w)
+    col_ids  = torch.arange(grid_w, device=device).repeat(grid_h)
+    cos      = torch.cat([cos_h[row_ids], cos_w[col_ids]], dim=-1)  # [T, head_dim]
+    sin      = torch.cat([sin_h[row_ids], sin_w[col_ids]], dim=-1)
+    return cos, sin
+
+
+def _rotate_half(x: Tensor) -> Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """x: [B, heads, T, head_dim]; cos/sin: [T, head_dim] — broadcasts over B and heads."""
+    return x * cos + _rotate_half(x) * sin
+
+
+# ---------------------------------------------------------------------------
+# Attention with QK-Norm and 2D RoPE
+# ---------------------------------------------------------------------------
+
+class Attention(nn.Module):
+    """Multi-head self-attention: QK-Norm + 2D RoPE on image tokens only."""
+
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim  = hidden_size // num_heads
+        self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+    def forward(
+        self,
+        x:     Tensor,
+        cos:   Tensor,
+        sin:   Tensor,
+        n_ctx: int,
+    ) -> Tensor:
+        """
+        x:     [B, n_ctx + T, D]
+        cos, sin: [T, head_dim] — applied to image tokens only
+        n_ctx: number of prepended conditioning tokens
+        """
+        B, L, D = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        def _heads(t: Tensor) -> Tensor:
+            return t.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q, k, v = _heads(q), _heads(k), _heads(v)   # [B, heads, L, head_dim]
+
+        # QK-Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # RoPE on image tokens only (skip first n_ctx positions)
+        if n_ctx < L:
+            q_img = _apply_rope(q[:, :, n_ctx:], cos, sin)
+            k_img = _apply_rope(k[:, :, n_ctx:], cos, sin)
+            q = torch.cat([q[:, :, :n_ctx], q_img], dim=2)
+            k = torch.cat([k[:, :, :n_ctx], k_img], dim=2)
+
+        out = F.scaled_dot_product_attention(q, k, v)   # [B, heads, L, head_dim]
+        out = out.transpose(1, 2).reshape(B, L, D)
+        return self.proj(out)
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU MLP
+# ---------------------------------------------------------------------------
+
+class SwiGLU(nn.Module):
+    """SwiGLU: hidden_dim ≈ 8/3 × dim keeps param count ≈ ratio-4 GELU MLP."""
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.up   = nn.Linear(dim, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+# ---------------------------------------------------------------------------
+# Conditioning helpers
+# ---------------------------------------------------------------------------
+
+def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    """adaLN: shift/scale [B, D] modulate sequence x [B, T, D]."""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep → MLP embedding (kept for weight compat)."""
+class ScalarEmbedder(nn.Module):
+    """Sinusoidal scalar → MLP embedding (used for α CFG conditioning)."""
 
     def __init__(self, hidden_size: int, freq_embed_size: int = 256):
         super().__init__()
+        self.freq_embed_size = freq_embed_size
         self.mlp = nn.Sequential(
             nn.Linear(freq_embed_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
-        self.freq_embed_size = freq_embed_size
 
     @staticmethod
-    def timestep_embedding(t: Tensor, dim: int, max_period: int = 10_000) -> Tensor:
-        half = dim // 2
+    def _sincos(t: Tensor, dim: int) -> Tensor:
+        half  = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(half, dtype=torch.float32) / half
-        ).to(t.device)
+            -math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half
+        )
         args = t[:, None].float() * freqs[None]
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: Tensor) -> Tensor:
-        emb = self.timestep_embedding(t, self.freq_embed_size)
-        return self.mlp(emb)
+        return self.mlp(self._sincos(t, self.freq_embed_size))
 
 
 class LabelEmbedder(nn.Module):
-    """Class label → embedding with optional dropout for CFG."""
+    """Class label → embedding with optional CFG dropout."""
 
     def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float = 0.0):
         super().__init__()
-        use_cfg = dropout_prob > 0
-        self.embedding = nn.Embedding(num_classes + (1 if use_cfg else 0), hidden_size)
-        self.num_classes = num_classes
+        use_cfg          = dropout_prob > 0
+        self.embedding   = nn.Embedding(num_classes + (1 if use_cfg else 0), hidden_size)
+        self.num_classes  = num_classes
         self.dropout_prob = dropout_prob
 
     def token_drop(self, labels: Tensor) -> Tensor:
@@ -81,125 +213,148 @@ class LabelEmbedder(nn.Module):
 # DiT block
 # ---------------------------------------------------------------------------
 
+def _round64(n: int) -> int:
+    return ((n + 63) // 64) * 64
+
+
 class DiTBlock(nn.Module):
-    """Single DiT block with adaLN-zero conditioning."""
+    """
+    DiT block: adaLN-zero (applied to all tokens) + Attention + SwiGLU.
+    Conditioning enters via both adaLN modulation AND in-context tokens in the sequence.
+    """
 
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden = int(hidden_size * mlp_ratio)
-        self.mlp   = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden, hidden_size),
-        )
-        # adaLN-zero: 6 parameters (shift/scale × 3) initialized to 0
-        self.adaLN_modulation = nn.Sequential(
+        swiglu_hidden = _round64(int(mlp_ratio * 2 / 3 * hidden_size))
+        self.norm1 = RMSNorm(hidden_size)
+        self.attn  = Attention(hidden_size, num_heads)
+        self.norm2 = RMSNorm(hidden_size)
+        self.mlp   = SwiGLU(hidden_size, swiglu_hidden)
+        # adaLN-zero: 6 outputs, initialized to 0 → identity at init
+        self.adaLN = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
 
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+    def forward(
+        self,
+        x:     Tensor,
+        c:     Tensor,
+        cos:   Tensor,
+        sin:   Tensor,
+        n_ctx: int,
+    ) -> Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
+            self.adaLN(c).chunk(6, dim=-1)
         )
-        # Self-attention
-        x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + gate_msa.unsqueeze(1) * attn_out
-        # MLP
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            _modulate(self.norm1(x), shift_msa, scale_msa), cos, sin, n_ctx
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp)
+            _modulate(self.norm2(x), shift_mlp, scale_mlp)
         )
         return x
 
 
 class FinalLayer(nn.Module):
-    """Output projection with adaLN conditioning."""
+    """Output projection with adaLN (image tokens only)."""
 
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm   = RMSNorm(hidden_size)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
+        self.adaLN  = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True),
         )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: Tensor, c: Tensor) -> Tensor:
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = modulate(self.norm_final(x), shift, scale)
-        return self.linear(x)
+        shift, scale = self.adaLN(c).chunk(2, dim=-1)
+        return self.linear(_modulate(self.norm(x), shift, scale))
 
 
 # ---------------------------------------------------------------------------
-# DiT model
+# Model configs
 # ---------------------------------------------------------------------------
 
 _CONFIGS = {
-    # name       depth  hidden  heads  patch
     "S/1":   dict(depth=12, hidden_size=384,  num_heads=6,  patch_size=1),
     "S/2":   dict(depth=12, hidden_size=384,  num_heads=6,  patch_size=2),
     "B/1":   dict(depth=12, hidden_size=768,  num_heads=12, patch_size=1),
     "B/2":   dict(depth=12, hidden_size=768,  num_heads=12, patch_size=2),
     "L/2":   dict(depth=24, hidden_size=1024, num_heads=16, patch_size=2),
     "XL/2":  dict(depth=28, hidden_size=1152, num_heads=16, patch_size=2),
+    # Pixel-space variants: 256×256 input, patch_size=16 → 256 tokens
+    "B/16":  dict(depth=12, hidden_size=768,  num_heads=12, patch_size=16),
+    "L/16":  dict(depth=24, hidden_size=1024, num_heads=16, patch_size=16),
+    "XL/16": dict(depth=28, hidden_size=1152, num_heads=16, patch_size=16),
 }
 
 
+# ---------------------------------------------------------------------------
+# DiT model
+# ---------------------------------------------------------------------------
+
 class DiT(nn.Module):
     """
-    Diffusion Transformer generator for the Drifting model.
+    Modernized DiT generator for the Drifting model.
 
-    Maps noise ε [B, C, H, W] + class label → generated sample x [B, C, H, W].
-    Timestep conditioning is kept (t=0) for pretrained-weight compatibility.
+    Conditioning enters via two paths simultaneously:
+      1. adaLN-zero: c modulates shift/scale/gate of every norm layer.
+      2. In-context tokens: c is projected to n_ctx_tokens prepended to the sequence,
+         so the transformer can attend directly to the conditioning information.
+
+    2D RoPE is applied only to image-patch tokens; context tokens are position-free.
     """
 
     def __init__(
         self,
-        variant: str = "B/2",
-        input_size: int = 32,        # spatial size of input (latent: 32, pixel: 256//patch)
-        in_channels: int = 4,
-        num_classes: int = 1000,
+        variant:          str   = "B/16",
+        input_size:       int   = 256,
+        in_channels:      int   = 3,
+        num_classes:      int   = 1000,
         cfg_dropout_prob: float = 0.0,
-        learn_sigma: bool = False,   # False for drifting (direct x prediction)
+        learn_sigma:      bool  = False,
+        n_ctx_tokens:     int   = 1,
     ):
         super().__init__()
         cfg = _CONFIGS[variant]
-        self.patch_size  = cfg["patch_size"]
-        self.hidden_size = cfg["hidden_size"]
-        self.num_heads   = cfg["num_heads"]
-        self.depth       = cfg["depth"]
-        self.in_channels = in_channels
+        self.patch_size   = cfg["patch_size"]
+        self.hidden_size  = cfg["hidden_size"]
+        self.num_heads    = cfg["num_heads"]
+        self.depth        = cfg["depth"]
+        self.in_channels  = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.input_size  = input_size
-        self.num_patches = (input_size // self.patch_size) ** 2
+        self.input_size   = input_size
+        self.grid_size    = input_size // self.patch_size
+        self.num_patches  = self.grid_size ** 2
+        self.n_ctx_tokens = n_ctx_tokens
 
         # Patch embedding
         self.x_embedder = nn.Linear(
             self.patch_size * self.patch_size * in_channels, self.hidden_size, bias=True
         )
-        # Position embedding (fixed sinusoidal, learnable alt also works)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches, self.hidden_size), requires_grad=False
+
+        # Conditioning → adaLN vector c [B, D]
+        self.cond_bias = nn.Parameter(torch.zeros(self.hidden_size))
+        self.y_embedder = (
+            LabelEmbedder(num_classes, self.hidden_size, cfg_dropout_prob)
+            if num_classes > 0 else None
+        )
+        self.alpha_embedder = (
+            ScalarEmbedder(self.hidden_size) if cfg_dropout_prob > 0 else None
         )
 
-        # Conditioning
-        self.t_embedder = TimestepEmbedder(self.hidden_size)
-        if num_classes > 0:
-            self.y_embedder = LabelEmbedder(num_classes, self.hidden_size, cfg_dropout_prob)
-        else:
-            self.y_embedder = None
+        # In-context conditioning tokens
+        self.ctx_proj = nn.Linear(self.hidden_size, n_ctx_tokens * self.hidden_size, bias=True)
 
-        # Transformer blocks
+        # Transformer
         self.blocks = nn.ModuleList([
             DiTBlock(self.hidden_size, self.num_heads) for _ in range(self.depth)
         ])
@@ -216,52 +371,22 @@ class DiT(nn.Module):
                     nn.init.zeros_(m.bias)
         self.apply(_basic_init)
 
-        # Sinusoidal pos embed
-        pos = self._get_2d_sincos_pos_embed(
-            self.hidden_size, int(self.num_patches ** 0.5)
-        )
-        self.pos_embed.data.copy_(torch.from_numpy(pos).float().unsqueeze(0))
-
-        # Patch embed std
+        # Patch embed
         w = self.x_embedder.weight.data
         nn.init.xavier_uniform_(w.view(w.shape[0], -1))
 
-        # Timestep MLP
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Label embed
         if self.y_embedder is not None:
             nn.init.normal_(self.y_embedder.embedding.weight, std=0.02)
-
-    @staticmethod
-    def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int):
-        import numpy as np
-        grid_h = np.arange(grid_size, dtype=np.float32)
-        grid_w = np.arange(grid_size, dtype=np.float32)
-        grid   = np.meshgrid(grid_w, grid_h)
-        grid   = np.stack(grid, axis=0).reshape(2, -1)
-
-        emb_h = DiT._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-        emb_w = DiT._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-        return np.concatenate([emb_h, emb_w], axis=1)   # [T, D]
-
-    @staticmethod
-    def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos):
-        import numpy as np
-        omega  = np.arange(embed_dim // 2, dtype=np.float64) / (embed_dim // 2)
-        omega  = 1.0 / 10000 ** omega
-        out    = np.einsum("m,d->md", pos, omega)
-        return np.concatenate([np.sin(out), np.cos(out)], axis=1).astype(np.float32)
+        if self.alpha_embedder is not None:
+            nn.init.normal_(self.alpha_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.alpha_embedder.mlp[2].weight, std=0.02)
 
     # ------------------------------------------------------------------
     def patchify(self, x: Tensor) -> Tensor:
-        """[B, C, H, W] → [B, T, patch_size²·C]"""
         p = self.patch_size
         return rearrange(x, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
 
     def unpatchify(self, x: Tensor, h: int, w: int) -> Tensor:
-        """[B, T, patch_size²·C] → [B, C, H, W]"""
         p = self.patch_size
         return rearrange(
             x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
@@ -271,55 +396,65 @@ class DiT(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        x: Tensor,
-        y: Tensor | None = None,
-        force_drop_label: bool = False,
+        x:                Tensor,
+        y:                Tensor | None = None,
+        force_drop_label: bool          = False,
+        alpha:            Tensor | None = None,
     ) -> Tensor:
         """
         Args:
-            x: [B, C, H, W] input noise ε
-            y: [B] integer class labels (or None for unconditional)
-            force_drop_label: force unconditional (CFG inference)
+            x:     [B, C, H, W] input noise ε
+            y:     [B] integer class labels (None → unconditional)
+            force_drop_label: force unconditional at inference
+            alpha: [B] CFG guidance scale α ≥ 1
         Returns:
-            out: [B, C, H, W] generated sample
+            [B, C, H, W]
         """
         B, C, H, W = x.shape
 
-        # Patch embed + pos
-        tokens = self.patchify(x)              # [B, T, p²C]
-        tokens = self.x_embedder(tokens)       # [B, T, D]
-        tokens = tokens + self.pos_embed       # broadcast
+        # Patch embed
+        tokens = self.patchify(x)           # [B, T, p²C]
+        tokens = self.x_embedder(tokens)    # [B, T, D]
 
-        # Conditioning: t=0 (fixed) + class label
-        t = torch.zeros(B, dtype=torch.long, device=x.device)
-        c = self.t_embedder(t)                 # [B, D]
+        # Build adaLN conditioning vector c [B, D]
+        c = self.cond_bias.unsqueeze(0).expand(B, -1)
         if self.y_embedder is not None and y is not None:
             c = c + self.y_embedder(y, force_drop=force_drop_label)
+        if self.alpha_embedder is not None and alpha is not None:
+            c = c + self.alpha_embedder(alpha.float())
 
-        # Transformer
+        # Prepend in-context conditioning tokens
+        ctx    = self.ctx_proj(c).view(B, self.n_ctx_tokens, self.hidden_size)
+        tokens = torch.cat([ctx, tokens], dim=1)   # [B, n_ctx + T, D]
+
+        # 2D RoPE for image tokens
+        head_dim = self.hidden_size // self.num_heads
+        cos, sin = build_2d_rope(self.grid_size, self.grid_size, head_dim, device=x.device)
+        # cos/sin: [T, head_dim] — broadcast over batch and heads in _apply_rope
+
+        # Transformer blocks
         for block in self.blocks:
-            tokens = block(tokens, c)
+            tokens = block(tokens, c, cos, sin, self.n_ctx_tokens)
 
-        # Output projection
-        tokens = self.final_layer(tokens, c)   # [B, T, p²·out_C]
-        out    = self.unpatchify(tokens, H, W) # [B, out_C, H, W]
-        return out
+        # Strip context tokens, project image tokens to pixels
+        img = tokens[:, self.n_ctx_tokens:]           # [B, T, D]
+        img = self.final_layer(img, c)                # [B, T, p²·out_C]
+        return self.unpatchify(img, H, W)             # [B, C, H, W]
 
     # ------------------------------------------------------------------
     @classmethod
     def from_config(cls, cfg) -> "DiT":
         return cls(
             variant=cfg.variant,
+            input_size=cfg.get("input_size", 256),
             in_channels=cfg.in_channels,
             num_classes=cfg.get("num_classes", 1000),
-            cfg_dropout_prob=0.0,
+            cfg_dropout_prob=cfg.get("cfg_dropout_prob", 0.0),
         )
 
     def load_pretrained(self, path: str):
-        """Load pretrained DiT weights (official release format)."""
         state = torch.load(path, map_location="cpu")
-        # Official checkpoint may be wrapped in 'model' key
         if "model" in state:
             state = state["model"]
         missing, unexpected = self.load_state_dict(state, strict=False)
-        print(f"[DiT] Loaded pretrained: {len(missing)} missing, {len(unexpected)} unexpected keys")
+        print(f"[DiT] Loaded: {len(missing)} missing, {len(unexpected)} unexpected keys")
