@@ -1,0 +1,48 @@
+name: mnist
+
+model:
+  type: dit
+  variant: Ti/4          # 4×4 patches on 28×28 → 49 tokens; tiny model for fast iteration
+  input_size: 28
+  in_channels: 1
+  num_classes: 10
+  pretrained: null
+
+encoder:
+  type: identity         # pixel space; no DINOv2 — keeps things simple
+
+kernel:
+  type: exponential
+  # taus: [0.5, 1.0, 2.0]     # pixel space: exp(-1/tau) at typical dist; needs larger tau than DINOv2
+  taus: [0.02, 0.05, 0.2]   # multiple temperatures summed per §A.6
+
+data:
+  type: mnist
+  root: data/mnist       # downloaded automatically on first run
+  batch_size: 1024            # random mixed-class batch (no stratification on single GPU)
+  num_workers: 11
+  # n_samples_per_class / n_uncond: only relevant when class_stratified=true (multi-GPU)
+
+training:
+  steps: 100_000
+  lr: 1e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_steps: 1_000
+  ema_decay: 0.999
+  precision: fp32        # fp32 for clarity; no bf16 needed on small model
+  ckpt_every: 5_000
+  log_every: 10
+  eval_every: 2_00
+  eval_batches: 20
+
+cfg:
+  enabled: false
+
+logging:
+  wandb: true
+  project: drifting-mnist
+  run_name: null
+  fid_samples: 512
+
+output_dir: checkpoints/mnist

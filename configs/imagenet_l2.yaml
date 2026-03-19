@@ -20,8 +20,10 @@ data:
   type: imagenet
   root: /mnt/bn/arnold-tiktok-search-raw-rel/chunhui.liu/datasets/imagenet-hf
   image_size: 256
-  n_samples_per_class: 96   # positives per step
-  n_uncond: 48               # uncond negatives per step (total batch = 192)
+  n_classes_per_batch: 8    # classes sampled per GPU per step
+  n_samples_per_class: 64   # images per class per step
+  n_uncond: 64               # uncond negatives  (total batch = n_classes*n_samples + n_uncond = 432)
+  class_stratified: true    # false → random mixed-class batch (ablation)
   num_workers: 12
 
 training:
@@ -34,7 +36,7 @@ training:
   precision: bf16
   ckpt_every: 20_000
   log_every: 20
-  eval_every: 10_000    # eval every N steps
+  eval_every: 2_000    # eval every N steps
   eval_batches: 100    # number of eval batches
 
 cfg:
@@ -44,6 +46,7 @@ cfg:
 logging:
   wandb: true
   project: drifting-imagenet
+  run_name: null        # null → use top-level name; set to override, e.g. "l2-stratified-v2"
   fid_samples: 2048     # samples for FID at each eval step (50000 for final eval)
 
 output_dir: checkpoints/imagenet_l2

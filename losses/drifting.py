@@ -17,134 +17,65 @@ Loss (Eq. 26):
   L_j  = MSE( φ̃_j(x),  sg(φ̃_j(x) + Ṽ_j) )
   Gradient flows through the frozen encoder back to x_gen.
 
-CFG (§3.5 / App. A.7):  k_pos × α,  k_unc × (α−1)
+Per-class structure (matching reference implementation):
+  For each class c, we preselect:
+    feat_gen_c  — generated images conditioned on class c
+    feat_pos_c  — real images of class c (strict same-class positives)
+    feat_neg_c  — generated images of class c + uncond images (negatives)
+  This guarantees V_pos only attracts toward same-class real images.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
 from kernels import DriftKernel
+from losses.dist_utils import all_gather, all_gather_nograd, get_rank_slice
 
 
 # ---------------------------------------------------------------------------
-# Distributed gather — gradients flow back to local rank only
-# ---------------------------------------------------------------------------
-
-class _GatherLayer(torch.autograd.Function):
-    """All-gather with gradient support for the local rank's slice."""
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        if not (dist.is_available() and dist.is_initialized()):
-            return (x,)
-        out = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(out, x.contiguous())
-        return tuple(out)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        x, = ctx.saved_tensors
-        if not (dist.is_available() and dist.is_initialized()):
-            return grads[0]
-        grad = torch.stack(grads)
-        dist.all_reduce(grad)
-        return grad[dist.get_rank()]
-
-
-def _all_gather(x: Tensor) -> Tensor:
-    """Gather x from all ranks → [world*N, C]. Grad flows to local slice."""
-    return torch.cat(_GatherLayer.apply(x), dim=0)
-
-
-def _all_gather_nograd(x: Tensor) -> Tensor:
-    """Gather x from all ranks → [world*N, C]. No gradient."""
-    if not (dist.is_available() and dist.is_initialized()):
-        return x
-    out = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-    dist.all_gather(out, x.contiguous())
-    return torch.cat(out, dim=0)
-
-
-def _rank() -> int:
-    return dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
-
-
-def _get_rank_slice(tensor: Tensor, local_size: int) -> Tensor:
-    r = _rank()
-    return tensor[r * local_size:(r + 1) * local_size]
-
-
-# ---------------------------------------------------------------------------
-# Core: drift field for one temperature
+# Core: drift field for one temperature, pre-selected features
 # ---------------------------------------------------------------------------
 
 def _drift_one_tau(
-    fx_norm:         Tensor,
-    fy_norm:         Tensor,
-    fu_norm:         Tensor | None,
-    tau_tilde:       float,
-    alpha:           float = 1.0,
-    same_class_mask: Tensor | None = None,
-) -> Tensor:
+    feat_gen: Tensor,   # [G, C] generated images of class c  (detached)
+    feat_pos: Tensor,   # [P, C] real images of class c       (stop-grad)
+    feat_neg: Tensor,   # [N, C] cross-class generated [+ uncond] (stop-grad)
+    tau_tilde: float,
+    alpha: float = 1.0,
+) -> tuple[Tensor, Tensor, Tensor]:
     """
-    Returns V_tilde [G, C] (stop-grad) for one temperature.
-    All inputs are already feature-normalised.
+    Returns (V/λ, V_pos/λ, V_neg/λ) for one temperature.
 
-    same_class_mask: [G, G] bool, True where labels_i == labels_j.
-    When provided, same-class pairs are excluded from the negative set so only
-    cross-class generated samples serve as negatives (matching paper's batching).
+    feat_neg contains images from OTHER classes (disjoint from feat_gen),
+    so no self-masking is needed.
     """
-    G, C = fx_norm.shape[0], fx_norm.shape[1]
-    use_cfg = fu_norm is not None
+    G, C = feat_gen.shape
+    N    = feat_neg.shape[0]
 
-    all_targets = torch.cat(
-        [fx_norm, fy_norm] + ([fu_norm] if use_cfg else []), dim=0
-    )
-    dist_mat = torch.cdist(fx_norm, all_targets, p=2)     # [G, G+P(+U)]
+    all_ref  = torch.cat([feat_neg, feat_pos], dim=0)    # [N+P, C]
+    dist_mat = torch.cdist(feat_gen, all_ref, p=2)        # [G, N+P]
 
-    if same_class_mask is not None:
-        dist_mat[:, :G][same_class_mask] = float("inf")
-    else:
-        dist_mat[:, :G].fill_diagonal_(float("inf"))
+    logits = -dist_mat / tau_tilde
+    nk_row = torch.softmax(logits, dim=0)
+    nk_col = torch.softmax(logits, dim=1)
+    nk = torch.sqrt(nk_row * nk_col)
 
-    k_raw = torch.exp(-dist_mat / tau_tilde)
+    nk_neg = nk[:, :N]
+    nk_pos = nk[:, N:]
+    s_neg  = nk_neg.sum(-1, keepdim=True)
+    s_pos  = nk_pos.sum(-1, keepdim=True)
 
-    # Apply CFG weights before normalisation.
-    # At α=1: k_unc *= 0 → unc columns vanish cleanly.
-    k_neg = k_raw[:, :G]
-    k_pos = k_raw[:, G:G + fy_norm.shape[0]] * alpha
-    if use_cfg:
-        k_unc = k_raw[:, G + fy_norm.shape[0]:] * (alpha - 1.0)
-        k_w = torch.cat([k_neg, k_pos, k_unc], dim=1)
-    else:
-        k_w = torch.cat([k_neg, k_pos], dim=1)
+    V_pos = (nk_pos * s_neg) @ feat_pos   # scale after normalization so alpha is not absorbed
+    V_neg = (nk_neg * s_pos) @ feat_neg
 
-    row_sum = k_w.sum(-1, keepdim=True)
-    col_sum = k_w.sum(0,  keepdim=True)
-    nk = k_w / (row_sum * col_sum).clamp_min(1e-12).sqrt()
-
-    P      = fy_norm.shape[0]
-    nk_neg = nk[:, :G]
-    nk_pos = nk[:, G:G + P]
-
-    if use_cfg:
-        nk_unc = nk[:, G + P:]
-        s_neg  = (nk_neg.sum(-1) + nk_unc.sum(-1)).unsqueeze(-1)
-    else:
-        s_neg = nk_neg.sum(-1, keepdim=True)
-
-    s_pos = nk_pos.sum(-1, keepdim=True)
-
-    V_j = (nk_pos * s_neg) @ fy_norm - (nk_neg * s_pos) @ fx_norm
-    if use_cfg:
-        V_j = V_j - (nk_unc * s_pos) @ fu_norm
-
-    lambda_j = ((V_j.pow(2).sum(-1) / C).mean()).sqrt().clamp_min(1e-6)
-    return V_j / lambda_j
+    V_j      = V_pos - V_neg
+    lambda_j = V_j.pow(2).mean().sqrt().clamp_min(1e-6)
+    # Always return float32 — matmul inside autocast (bf16) would otherwise produce bf16,
+    # which mismatches the float32 V_sum accumulator.
+    return (V_j / lambda_j).float(), (V_pos / lambda_j).float(), (V_neg / lambda_j).float()
 
 
 # ---------------------------------------------------------------------------
@@ -157,26 +88,24 @@ def _encode_normalise(encoder, x_gen: Tensor, y_pos: Tensor,
     Returns (fx_norm, fy_norm, fu_norm, sqrt_C).
     fx_norm has gradients; fy_norm/fu_norm are stop-grad.
     """
-    if encoder is not None:
-        with torch.no_grad():
-            fy = encoder(y_pos).float()
-            fu = encoder(y_unc).float() if y_unc is not None else None
-        fx = encoder(x_gen).float()
-    else:
-        fx = x_gen.flatten(1).float()
-        fy = y_pos.flatten(1).float()
-        fu = y_unc.flatten(1).float() if y_unc is not None else None
+    if encoder is None:
+        fx_norm = F.normalize(x_gen.flatten(1).float(), p=2)
+        fy_norm = F.normalize(y_pos.flatten(1).float(), p=2)
+        fu_norm = F.normalize(y_unc.flatten(1).float(), p=2) if y_unc is not None else None
+        return fx_norm, fy_norm, fu_norm, 1
+
+    with torch.no_grad():
+        fy = encoder(y_pos).float()
+        fu = encoder(y_unc).float() if y_unc is not None else None
+    fx = encoder(x_gen).float()
 
     C      = fx.shape[-1]
     sqrt_C = C ** 0.5
 
     with torch.no_grad():
-        all_ref  = torch.cat([fx.detach(), fy] + ([fu] if fu is not None else []), dim=0)
-        dist_all = torch.cdist(fx.detach(), all_ref, p=2)
-        G        = fx.shape[0]
-        dist_all[:, :G].fill_diagonal_(float("inf"))
-        finite = dist_all[dist_all.isfinite()]
-        S_j    = (finite.mean() / sqrt_C).clamp_min(1e-6)
+        ref_only = torch.cat([fy] + ([fu] if fu is not None else []), dim=0)
+        dist_ref = torch.cdist(fx.detach(), ref_only, p=2)   # [G, P+U], no self-distances
+        S_j      = (dist_ref.mean() / sqrt_C).clamp_min(1e-6)
 
     fx_norm = fx / S_j
     fy_norm = fy / S_j
@@ -186,77 +115,191 @@ def _encode_normalise(encoder, x_gen: Tensor, y_pos: Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Public loss functions
+# Public loss function
 # ---------------------------------------------------------------------------
 
 def drifting_loss(
-    x_gen:  Tensor,
-    y_pos:  Tensor,
-    kernel: DriftKernel,
-    labels: Tensor | None = None,
+    x_gen:      Tensor,
+    y_pos:      Tensor,
+    kernel:     DriftKernel,
+    labels:     Tensor | None = None,
+    labels_pos: Tensor | None = None,
+    y_uncond:   Tensor | None = None,
+    alpha:      float = 1.0,           # kept for API compatibility; not used in kernel
 ) -> tuple[Tensor, dict]:
+    """
+    Per-class drifting loss.
+
+    For each class c present in the batch the loss selects:
+      feat_gen_c  — generated images of class c
+      feat_pos_c  — real images of class c (strict same-class positives)
+      feat_neg_c  — generated images of class c + uncond images (if any)
+
+    labels:     class labels for x_gen (required for per-class logic).
+    labels_pos: class labels for y_pos. Defaults to labels when y_pos and
+                x_gen share the same classes (the common case).
+    y_uncond:   unconditional real images merged into the negative set.
+    """
     encoder = getattr(kernel, "encoder", None)
     taus    = getattr(kernel, "taus", [getattr(kernel, "tau", 0.05)])
 
-    fx_norm, fy_norm, _, sqrt_C = _encode_normalise(encoder, x_gen, y_pos)
-    G_local = fx_norm.shape[0]
+    fx_norm, fy_norm, fu_norm, sqrt_C = _encode_normalise(encoder, x_gen, y_pos, y_uncond)
 
-    fx_norm_all = _all_gather(fx_norm)
-    fy_norm_all = _all_gather_nograd(fy_norm)
-    labels_all  = _all_gather_nograd(labels) if labels is not None else None
+    _lpos = labels_pos if labels_pos is not None else labels
 
-    same_class_mask = (labels_all.unsqueeze(0) == labels_all.unsqueeze(1)) if labels_all is not None else None
-    V_sum = sum(
-        _drift_one_tau(fx_norm_all.detach(), fy_norm_all, None, tau * sqrt_C,
-                       same_class_mask=same_class_mask)
-        for tau in taus
-    )
+    # Accumulators for V across classes — filled in the per-class loop below
+    V_sum     = torch.zeros_like(fx_norm)
+    V_pos_sum = torch.zeros_like(fx_norm)
+    V_neg_sum = torch.zeros_like(fx_norm)
 
-    V_local       = _get_rank_slice(V_sum, G_local)
-    fx_norm_local = _get_rank_slice(fx_norm_all, G_local)
-    target = fx_norm_local.detach() + V_local
-    loss   = F.mse_loss(fx_norm_local, target)
+    if labels is None:
+        classes = [None]
+    else:
+        classes = labels.unique().tolist()
+
+    for c in classes:
+        if c is None:
+            mask_gen = torch.ones(fx_norm.shape[0], dtype=torch.bool, device=fx_norm.device)
+            mask_pos = torch.ones(fy_norm.shape[0], dtype=torch.bool, device=fy_norm.device)
+        else:
+            mask_gen = labels == c
+            mask_pos = _lpos == c
+            if not mask_gen.any() or not mask_pos.any():
+                continue
+
+        feat_gen_c = fx_norm[mask_gen]
+        feat_pos_c = fy_norm[mask_pos]
+
+        # Negatives: cross-class generated images + uncond (if any).
+        # Fall back to same-class when no other class exists in the batch.
+        mask_neg   = ~mask_gen if labels is not None else torch.zeros_like(mask_gen)
+        feat_neg_c = fx_norm[mask_neg].detach() if mask_neg.any() else feat_gen_c.detach()
+        if fu_norm is not None:
+            feat_neg_c = torch.cat([feat_neg_c, fu_norm], dim=0)
+
+        n_pos = feat_pos_c.shape[0]
+        n_neg = feat_neg_c.shape[0]
+        auto_alpha = n_neg / max(n_pos, 1)   # balance kernel mass: N_neg pos-weighted cols vs N_neg neg cols
+
+        V_c = V_pos_c = V_neg_c = None
+        for tau in taus:
+            V_tau, Vp_tau, Vn_tau = _drift_one_tau(
+                feat_gen_c.detach(), feat_pos_c, feat_neg_c, tau * sqrt_C, auto_alpha,
+            )
+            V_c     = V_tau  if V_c     is None else V_c     + V_tau
+            V_pos_c = Vp_tau if V_pos_c is None else V_pos_c + Vp_tau
+            V_neg_c = Vn_tau if V_neg_c is None else V_neg_c + Vn_tau
+
+        V_sum[mask_gen]     = V_c
+        V_pos_sum[mask_gen] = V_pos_c
+        V_neg_sum[mask_gen] = V_neg_c
+
+    target = fx_norm.detach() + V_sum
+    loss   = F.mse_loss(fx_norm, target)
 
     with torch.no_grad():
-        v_norm = V_local.norm(dim=-1).mean()
+        v_norms = V_sum.norm(dim=-1)
+    return loss, {
+        "loss":      loss.item(),
+        "V_norm":    v_norms.mean().item(),
+        "V_std":     v_norms.std().item(),
+        "V_max":     V_sum.abs().max().item(),
+        "V_pos":     V_pos_sum.norm(dim=-1).mean().item(),
+        "V_neg":     V_neg_sum.norm(dim=-1).mean().item(),
+        "feat_norm": fx_norm.norm(dim=-1).mean().item(),
+    }
 
-    return loss, {"loss": loss.item(), "V_norm": v_norm.item()}
-
-
-def drifting_loss_cfg(
-    x_gen_cond:   Tensor,
-    y_pos_cond:   Tensor,
-    y_pos_uncond: Tensor,
-    kernel:       DriftKernel,
-    alpha:        float,
-    labels:       Tensor | None = None,
+def drifting_loss_all_gather(
+    x_gen:      Tensor,
+    y_pos:      Tensor,
+    kernel:     DriftKernel,
+    labels:     Tensor | None = None,
+    labels_pos: Tensor | None = None,
+    y_uncond:   Tensor | None = None,
+    alpha:      float = 1.0,
 ) -> tuple[Tensor, dict]:
+    """
+    Same as drifting_loss but all-gathers fx_norm/fy_norm/fu_norm across ranks
+    before the per-class loop, so each GPU sees the full cross-GPU feature pool.
+    Gradient flows back to the local rank's slice of fx_norm only.
+    """
     encoder = getattr(kernel, "encoder", None)
     taus    = getattr(kernel, "taus", [getattr(kernel, "tau", 0.05)])
 
-    fx_norm, fy_norm, fu_norm, sqrt_C = _encode_normalise(
-        encoder, x_gen_cond, y_pos_cond, y_pos_uncond
-    )
+    fx_norm, fy_norm, fu_norm, sqrt_C = _encode_normalise(encoder, x_gen, y_pos, y_uncond)
     G_local = fx_norm.shape[0]
 
-    fx_norm_all = _all_gather(fx_norm)
-    fy_norm_all = _all_gather_nograd(fy_norm)
-    fu_norm_all = _all_gather_nograd(fu_norm)
-    labels_all  = _all_gather_nograd(labels) if labels is not None else None
+    fx_norm_all = all_gather(fx_norm)                                         # grad → local slice
+    fy_norm_all = all_gather_nograd(fy_norm)
+    fu_norm_all = all_gather_nograd(fu_norm) if fu_norm is not None else None
 
-    same_class_mask = (labels_all.unsqueeze(0) == labels_all.unsqueeze(1)) if labels_all is not None else None
-    V_sum = sum(
-        _drift_one_tau(fx_norm_all.detach(), fy_norm_all, fu_norm_all, tau * sqrt_C, alpha,
-                       same_class_mask=same_class_mask)
-        for tau in taus
-    )
+    _lpos    = labels_pos if labels_pos is not None else labels
+    lgen_all = all_gather_nograd(labels) if labels is not None else None
+    lpos_all = all_gather_nograd(_lpos)  if _lpos  is not None else None
 
-    V_local       = _get_rank_slice(V_sum, G_local)
-    fx_norm_local = _get_rank_slice(fx_norm_all, G_local)
-    target = fx_norm_local.detach() + V_local
-    loss   = F.mse_loss(fx_norm_local, target)
+    V_sum_all     = torch.zeros_like(fx_norm_all)
+    V_pos_sum_all = torch.zeros_like(fx_norm_all)
+    V_neg_sum_all = torch.zeros_like(fx_norm_all)
+
+    if lgen_all is None:
+        classes = [None]
+    else:
+        classes = lgen_all.unique().tolist()
+
+    for c in classes:
+        if c is None:
+            mask_gen = torch.ones(fx_norm_all.shape[0], dtype=torch.bool, device=fx_norm_all.device)
+            mask_pos = torch.ones(fy_norm_all.shape[0], dtype=torch.bool, device=fy_norm_all.device)
+        else:
+            mask_gen = lgen_all == c
+            mask_pos = lpos_all == c
+            if not mask_gen.any() or not mask_pos.any():
+                continue
+
+        feat_gen_c = fx_norm_all[mask_gen]
+        feat_pos_c = fy_norm_all[mask_pos]
+
+        mask_neg   = ~mask_gen if lgen_all is not None else torch.zeros_like(mask_gen)
+        feat_neg_c = fx_norm_all[mask_neg].detach() if mask_neg.any() else feat_gen_c.detach()
+        if fu_norm_all is not None:
+            feat_neg_c = torch.cat([feat_neg_c, fu_norm_all], dim=0)
+
+        n_pos = feat_pos_c.shape[0]
+        n_neg = feat_neg_c.shape[0]
+        auto_alpha = n_neg / max(n_pos, 1)
+
+        V_c = V_pos_c = V_neg_c = None
+        for tau in taus:
+            V_tau, Vp_tau, Vn_tau = _drift_one_tau(
+                feat_gen_c.detach(), feat_pos_c, feat_neg_c, tau * sqrt_C, auto_alpha,
+            )
+            V_c     = V_tau  if V_c     is None else V_c     + V_tau
+            V_pos_c = Vp_tau if V_pos_c is None else V_pos_c + Vp_tau
+            V_neg_c = Vn_tau if V_neg_c is None else V_neg_c + Vn_tau
+
+        V_sum_all[mask_gen]     = V_c
+        V_pos_sum_all[mask_gen] = V_pos_c
+        V_neg_sum_all[mask_gen] = V_neg_c
+
+    target = fx_norm_all.detach() + V_sum_all
+    loss   = F.mse_loss(fx_norm_all, target)
 
     with torch.no_grad():
-        v_norm = V_local.norm(dim=-1).mean()
+        V_local  = get_rank_slice(V_sum_all,     G_local)
+        Vp_local = get_rank_slice(V_pos_sum_all, G_local)
+        Vn_local = get_rank_slice(V_neg_sum_all, G_local)
+        fx_local = get_rank_slice(fx_norm_all,   G_local)
+        v_norms  = V_local.norm(dim=-1)
+    return loss, {
+        "loss":      loss.item(),
+        "V_norm":    v_norms.mean().item(),
+        "V_std":     v_norms.std().item(),
+        "V_max":     V_local.abs().max().item(),
+        "V_pos":     Vp_local.norm(dim=-1).mean().item(),
+        "V_neg":     Vn_local.norm(dim=-1).mean().item(),
+        "feat_norm": fx_local.norm(dim=-1).mean().item(),
+    }
 
-    return loss, {"loss": loss.item(), "V_norm": v_norm.item()}
+
+# Alias kept for call-site clarity; both resolve to the same function.
+drifting_loss_cfg = drifting_loss
